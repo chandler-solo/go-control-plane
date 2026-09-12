@@ -110,3 +110,14 @@ REST fetches are unchanged.
 `NewSnapshotCacheWithOptions(hash, logger)` defaults to non-ADS mode; use
 `WithADS()` alone to select the legacy ADS policy. Filtering is opt-in because
 some consumers may use the legacy delay to coordinate resource warming.
+
+What the option gives up is that coordination. The legacy policy answers a
+named type only once the client has named every resource of that type in the
+snapshot, which makes Envoy wait for its CDS or LDS to name every cluster or
+route before any endpoints or routes arrive. With filtering, a client that
+names a resource absent from the snapshot is answered without it and keeps
+waiting for that name; a resource it has not named is never sent to it; and a
+newly added cluster or route reaches the client when it re-requests with the
+new name after its CDS or LDS changes, which Envoy does on every such change.
+When the legacy policy holds a response, the cache logs it at debug level with
+the watch, type and names, so a withheld named type can be found in logs.
