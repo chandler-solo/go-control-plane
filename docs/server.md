@@ -109,3 +109,24 @@ func (cb *Callbacks) OnFetchResponse(*discovery.DiscoveryRequest, *discovery.Dis
 The internal go-control-plane gRPC server implementations take care of managing watches with the [Config Watcher](https://github.com/envoyproxy/go-control-plane/blob/main/pkg/cache/v3/cache.go#L45) when new xDS clients register themselves.
 
 > *NOTE*: The server supports REST/JSON as well as gRPC bi-di streaming
+
+## Damping repeated SotW NACKs
+
+By default, a NACK can immediately resend the same snapshot version because
+the request carries the client's last accepted version. To wait for a changed
+version after rejection, construct the server with `server.WithNackDamping()`:
+
+```go
+srv := server.NewServer(ctx, snapshotCache, callbacks, server.WithNackDamping())
+```
+
+The option applies to dedicated SotW streams and both ADS modes. For a NACK
+whose nonce matches the last response of that type, the server gives the cache
+a cloned request carrying the rejected version. The original request and its
+error detail remain available to `OnStreamRequest`. The cache parks unchanged
+subscriptions until the snapshot version changes; a corrected version is sent
+normally. Subscription changes can still request newly subscribed resources.
+
+Damping is disabled by default and does not affect delta streams. Control
+planes must change the version when correcting configuration. Changing content
+without a new version cannot reliably trigger a response, even without damping.

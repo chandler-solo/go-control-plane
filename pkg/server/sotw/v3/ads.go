@@ -110,15 +110,24 @@ func (s *server) processADS(sw *streamWrapper, reqCh chan *discovery.DiscoveryRe
 				subscription = stream.NewSotwSubscription(req.GetResourceNames(), s.opts.IsLegacyWildcardActive(typeURL))
 			}
 
-			cancel, err := s.cache.CreateWatch(req, subscription, respChan)
+			cacheReq := req
+			if s.opts.NackDamping {
+				cacheReq = w.dampNack(req)
+			}
+			cancel, err := s.cache.CreateWatch(cacheReq, subscription, respChan)
 			if err != nil {
 				return err
 			}
-			sw.watches.addWatch(typeURL, &watch{
+			next := &watch{
 				cancel:   cancel,
 				response: respChan,
 				sub:      subscription,
-			})
+			}
+			if s.opts.NackDamping && w != nil {
+				next.nonce = w.nonce
+				next.lastVersion = w.lastVersion
+			}
+			sw.watches.addWatch(typeURL, next)
 		}
 	}
 }

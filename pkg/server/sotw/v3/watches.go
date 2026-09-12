@@ -4,6 +4,8 @@ import (
 	"context"
 	"reflect"
 
+	"google.golang.org/protobuf/proto"
+
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/cache/types"
 	"github.com/envoyproxy/go-control-plane/pkg/cache/v3"
@@ -69,6 +71,18 @@ type watch struct {
 	sub stream.Subscription
 	// Nonce of the latest response sent for this type
 	nonce string
+	// Version of the latest response sent for this type.
+	lastVersion string
+}
+
+func (w *watch) dampNack(req *discovery.DiscoveryRequest) *discovery.DiscoveryRequest {
+	if w == nil || w.nonce == "" || req.GetResponseNonce() != w.nonce || req.GetErrorDetail() == nil {
+		return req
+	}
+	// Callbacks retain the original request and its last accepted version.
+	cloned := proto.Clone(req).(*discovery.DiscoveryRequest)
+	cloned.VersionInfo = w.lastVersion
+	return cloned
 }
 
 // close cancels an open watch.

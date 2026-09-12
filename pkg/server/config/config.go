@@ -8,6 +8,9 @@ type Opts struct {
 	// If true respond to ADS requests with a guaranteed resource ordering
 	Ordered bool
 
+	// NackDamping parks matching SotW NACKs at the last sent version.
+	NackDamping bool
+
 	Logger log.Logger
 
 	// If true, deactivate legacy wildcard mode for all resource types

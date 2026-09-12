@@ -165,6 +165,12 @@ func (c CallbackFuncs) OnFetchResponse(req *discovery.DiscoveryRequest, resp *di
 	}
 }
 
+// WithNackDamping suppresses immediate resends of a rejected SotW version.
+// It is disabled by default and does not affect delta streams.
+func WithNackDamping() config.XDSOption {
+	return sotw.WithNackDamping()
+}
+
 // NewServer creates handlers from a config watcher and callbacks.
 func NewServer(ctx context.Context, config cache.Cache, callbacks Callbacks, opts ...config.XDSOption) Server {
 	return NewServerAdvanced(rest.NewServer(config, callbacks),

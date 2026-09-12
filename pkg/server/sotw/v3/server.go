@@ -68,6 +68,12 @@ func WithOrderedADS() config.XDSOption {
 	}
 }
 
+// WithNackDamping suppresses immediate resends of a rejected SotW version.
+// A matching NACK waits for a new snapshot version. Damping is disabled by default.
+func WithNackDamping() config.XDSOption {
+	return func(o *config.Opts) { o.NackDamping = true }
+}
+
 // WithLogger configures the server logger. Defaults to no logging.
 func WithLogger(logger log.Logger) config.XDSOption {
 	return func(o *config.Opts) {
@@ -149,6 +155,7 @@ func (s *streamWrapper) send(resp cache.Response) error {
 	// Track in the type subcription the nonce and objects returned to the client.
 	w.sub.SetReturnedResources(resp.GetReturnedResources())
 	w.nonce = out.Nonce
+	w.lastVersion = out.VersionInfo
 
 	// Register with the callbacks provided that we are sending the response.
 	if s.callbacks != nil {

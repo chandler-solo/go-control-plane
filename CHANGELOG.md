@@ -4,6 +4,8 @@
 
 ### Added
 
+- Added opt-in SotW NACK damping to wait for a new snapshot version after a matching rejection.
+
 - Added snapshot-cache constructor options for ADS and opt-in subscription-filtered named responses.
 
 ### Fixed
