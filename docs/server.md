@@ -130,3 +130,14 @@ normally. Subscription changes can still request newly subscribed resources.
 Damping is disabled by default and does not affect delta streams. Control
 planes must change the version when correcting configuration. Changing content
 without a new version cannot reliably trigger a response, even without damping.
+
+Two details of the option are visible to clients. First, Envoy keeps the error
+detail on every request for a type until it accepts a new version, so a
+subscription change made while rejected arrives as a NACK; damping still lets
+the cache answer it, because the request names a resource not yet returned,
+and that response carries the rejected version. The client rejects it once
+more and the stream parks again, so re-sends of rejected content are bounded
+by the client's own subscription changes. Second, with damping on the server
+carries the last nonce and version onto the watch that replaces a completed
+one, so a later request with an older nonce is treated as stale even though no
+response has been sent since; without damping such a request is accepted.
