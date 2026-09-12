@@ -87,3 +87,26 @@ nil status after `ClearSnapshot` as the signal that a node is gone should check
 `GetSnapshot` for the absent snapshot instead, or cancel the streams first.
 Cancelling a watch takes only the read lock unless it is the last watch of a
 cleared node, so the retained status does not slow down watch churn.
+
+## Subscription-filtered ADS responses
+
+The default ADS policy waits until every resource in a snapshot type is named
+by the client. When snapshots include resources that a client will never
+request, its named responses can remain blocked across revisions. To answer
+with just the client's subscribed resources, opt in when constructing the cache:
+
+```go
+c := cache.NewSnapshotCacheWithOptions(cache.IDHash{}, nil,
+    cache.WithADS(), cache.WithSubscriptionFilteredResponses())
+```
+
+The option affects immediate and parked named SotW ADS watches. Wildcard
+responses still include all resources. Snapshot maps are not modified, and
+equal-version requests still return newly subscribed resources. Empty
+subscriptions receive no response and register no watch. Delta watches and
+REST fetches are unchanged.
+
+`NewSnapshotCache(ads, hash, logger)` keeps its signature and default policy.
+`NewSnapshotCacheWithOptions(hash, logger)` defaults to non-ADS mode; use
+`WithADS()` alone to select the legacy ADS policy. Filtering is opt-in because
+some consumers may use the legacy delay to coordinate resource warming.
