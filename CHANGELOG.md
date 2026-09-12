@@ -12,6 +12,8 @@
 
 ### Fixed
 
+- Answer a SotW watch opened before the node had any snapshot when the first snapshot arrives, even at the version the request already holds; that version was accepted on an earlier stream and does not make the watch up to date.
+
 - Send snapshot and heartbeat responses outside cache-wide locks, allowing unrelated nodes to progress while a response channel is full.
 
 - Preserve open SotW and delta watches when clearing snapshots, and remove cleared status after the last watch is canceled. `GetStatusInfo` now stays non-nil for a cleared node while its watches are open.

@@ -142,3 +142,20 @@ closes the caller's response channel; a response already ready for delivery
 can race with cancellation. Callers must not close that channel while a sender
 can still use it. The server cancels watches and stops reading their channels
 without closing them.
+
+## Watches opened before the first snapshot
+
+A SotW watch opened while the node has no snapshot carries whatever version
+the client accepted before, on an earlier stream or from an earlier control
+plane. Nothing has been sent on that watch, so the first snapshot for the node
+answers it even when the snapshot's version equals the request's. Without
+this, a control plane that republishes the same content under the same
+version after its own restart leaves every reconnected client parked, and a
+client whose cluster was warming when the stream broke stays warming until
+its own fetch timeout, with CDS paused meanwhile.
+
+The rule applies only to watches opened before any snapshot existed. Once a
+snapshot exists, an equal-version request parks and an equal-version
+republish sends nothing, as before. Delta watches are unchanged: a delta
+client sends per-resource versions and the first snapshot is compared
+against those.
