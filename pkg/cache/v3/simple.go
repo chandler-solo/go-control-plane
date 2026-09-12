@@ -123,6 +123,8 @@ type snapshotCache struct {
 	// hash is the hashing function for Envoy nodes
 	hash NodeHash
 
+	responseLocks map[string]*nodeResponseLock
+
 	mu sync.RWMutex
 }
 
@@ -201,16 +203,17 @@ func NewSnapshotCacheWithHeartbeating(ctx context.Context, ads bool, hash NodeHa
 	cache := newSnapshotCache(ads, hash, logger)
 	go func() {
 		t := time.NewTicker(heartbeatInterval)
+		defer t.Stop()
 
 		for {
 			select {
 			case <-t.C:
-				cache.mu.Lock()
-				for node := range cache.status {
-					// TODO(snowp): Omit heartbeats if a real response has been sent recently.
+				cache.mu.RLock()
+				nodes := slices.Collect(maps.Keys(cache.status))
+				cache.mu.RUnlock()
+				for _, node := range nodes {
 					cache.sendHeartbeats(ctx, node)
 				}
-				cache.mu.Unlock()
 			case <-ctx.Done():
 				return
 			}
@@ -220,196 +223,162 @@ func NewSnapshotCacheWithHeartbeating(ctx context.Context, ads bool, hash NodeHa
 }
 
 func (cache *snapshotCache) sendHeartbeats(ctx context.Context, node string) {
-	snapshot, ok := cache.snapshots[node]
-	if !ok {
+	unlock, err := cache.lockResponses(ctx, node)
+	if err != nil {
 		return
 	}
-
-	if info, ok := cache.status[node]; ok {
-		info.mu.Lock()
-		for id, watch := range info.watches {
-			// Respond with the current version regardless of whether the version has changed.
-			version := snapshot.GetVersion(watch.Request.GetTypeUrl())
-			resources := snapshot.GetResourcesAndTTL(watch.Request.GetTypeUrl())
-
-			resourcesToReturn := map[string]*cachedResource{}
-			addResource := func(name string, res types.ResourceWithTTL) {
-				if res.TTL == nil {
-					return
-				}
-				if _, ok = resourcesToReturn[name]; ok {
-					// Already added
-					return
-				}
-				resourcesToReturn[name] = newCachedResourceWithTTL(name, res, version)
-			}
-
-			if watch.subscription.IsWildcard() {
-				resourcesToReturn = make(map[string]*cachedResource, len(resources))
-				for name, res := range resources {
-					addResource(name, res)
-				}
-			}
-			for name := range watch.subscription.SubscribedResources() {
-				if res, ok := resources[name]; ok {
-					addResource(name, res)
-				}
-			}
-
-			if len(resourcesToReturn) == 0 {
-				continue
-			}
-
-			resp := &RawResponse{
-				Request:   watch.Request,
-				Version:   version,
-				resources: slices.Collect(maps.Values(resourcesToReturn)),
-				// Do not alter it. Those TTLs do not touch what's actually in watches.
-				returnedResources: watch.subscription.ReturnedResources(),
-				Heartbeat:         true,
-				Ctx:               ctx,
-			}
-
-			cache.log.Debugf("respond open watch %d %v with heartbeat for version %q", id, watch.Request.GetResourceNames(), version)
-			err := cache.respond(ctx, watch, resp)
-			if err != nil {
-				cache.log.Errorf("received error when attempting to respond to watches: %v", err)
-			} else {
-				// The watch must be deleted and we must rely on the client to ack this response to create a new watch.
-				delete(info.watches, id)
-			}
-		}
-		info.mu.Unlock()
-	}
-}
-
-// SetSnapshotCache updates a snapshot for a node.
-func (cache *snapshotCache) SetSnapshot(ctx context.Context, node string, snapshot ResourceSnapshot) error {
+	defer unlock()
 	cache.mu.Lock()
-	defer cache.mu.Unlock()
-
-	cache.log.Debugf("setting snapshot for node %s", node)
-	// update the existing entry
-	cache.snapshots[node] = snapshot
-
-	// trigger existing watches for which version changed
-	if info, ok := cache.status[node]; ok {
-		info.mu.Lock()
-		defer info.mu.Unlock()
-		info.snapshotCleared = false
-
-		// Respond to SOTW watches for the node.
-		if err := cache.respondSOTWWatches(ctx, info, snapshot); err != nil {
-			return err
-		}
-
-		// Respond to delta watches for the node.
-		return cache.respondDeltaWatches(ctx, info, snapshot)
+	snapshot, exists := cache.snapshots[node]
+	info := cache.status[node]
+	if !exists || info == nil {
+		cache.mu.Unlock()
+		return
 	}
-
-	return nil
+	info.mu.Lock()
+	pending := cache.collectHeartbeats(info, snapshot)
+	info.responsesInFlight += len(pending)
+	info.mu.Unlock()
+	cache.mu.Unlock()
+	if err := cache.sendResponses(ctx, node, info, pending, nil); err != nil {
+		cache.log.Errorf("failed to send heartbeat responses: %v", err)
+	}
 }
 
-func (cache *snapshotCache) respondSOTWWatches(ctx context.Context, info *statusInfo, snapshot ResourceSnapshot) error {
-	// responder callback for SOTW watches
-	respond := func(watch ResponseWatch, id int64) error {
+func (cache *snapshotCache) collectHeartbeats(info *statusInfo, snapshot ResourceSnapshot) []pendingSotwResponse {
+	var pending []pendingSotwResponse
+	info.orderResponseWatches()
+	for _, key := range info.orderedWatches {
+		id := key.ID
+		watch := info.watches[id]
+		// Respond with the current version regardless of whether the version has changed.
 		version := snapshot.GetVersion(watch.Request.GetTypeUrl())
-		if version == watch.Request.GetVersionInfo() {
-			// Snapshot did not change, no reply.
-			return nil
+		resources := snapshot.GetResourcesAndTTL(watch.Request.GetTypeUrl())
+
+		resourcesToReturn := map[string]*cachedResource{}
+		addResource := func(name string, res types.ResourceWithTTL) {
+			if res.TTL == nil {
+				return
+			}
+			if _, exists := resourcesToReturn[name]; exists {
+				// Already added
+				return
+			}
+			resourcesToReturn[name] = newCachedResourceWithTTL(name, res, version)
 		}
 
-		cache.log.Debugf("consider open watch %d %s %v with new version %q", id, watch.Request.GetTypeUrl(), watch.Request.GetResourceNames(), version)
-		resp, declined := createResponse(snapshot, watch, cache.ads, cache.subscriptionFilteredResponses)
-		if declined {
-			cache.log.Debugf("ADS mode: holding open watch %d %s %v at version %q: the snapshot has resources the client has not named", id, watch.Request.GetTypeUrl(), watch.Request.GetResourceNames(), version)
-		}
-		if resp != nil {
-			cache.log.Debugf("respond open watch %d %s %v with new version %q", id, watch.Request.GetTypeUrl(), watch.Request.GetResourceNames(), version)
-			err := cache.respond(ctx, watch, resp)
-			if err != nil {
-				return err
+		if watch.subscription.IsWildcard() {
+			resourcesToReturn = make(map[string]*cachedResource, len(resources))
+			for name, res := range resources {
+				addResource(name, res)
 			}
-			// discard the watch
-			delete(info.watches, id)
 		}
-		// If we did not reply we just keep the watch
-		return nil
+		for name := range watch.subscription.SubscribedResources() {
+			if res, ok := resources[name]; ok {
+				addResource(name, res)
+			}
+		}
+
+		if len(resourcesToReturn) == 0 {
+			continue
+		}
+
+		resp := &RawResponse{
+			Request:   watch.Request,
+			Version:   version,
+			resources: slices.Collect(maps.Values(resourcesToReturn)),
+			// Do not alter it. Those TTLs do not touch what's actually in watches.
+			returnedResources: maps.Clone(watch.subscription.ReturnedResources()),
+			Heartbeat:         true,
+		}
+
+		pending = append(pending, pendingSotwResponse{id: id, watch: watch, response: resp})
+		delete(info.watches, id)
 	}
-
-	// If ADS is enabled we need to order response watches so we guarantee
-	// sending them in the correct order. Go's default implementation
-	// of maps are randomized order when ranged over.
-	if cache.ads {
-		info.orderResponseWatches()
-		for _, key := range info.orderedWatches {
-			err := respond(info.watches[key.ID], key.ID)
-			if err != nil {
-				return err
-			}
-		}
-	} else {
-		for id, watch := range info.watches {
-			err := respond(watch, id)
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
+	return pending
 }
 
-func (cache *snapshotCache) respondDeltaWatches(ctx context.Context, info *statusInfo, snapshot ResourceSnapshot) error {
-	// We only calculate version hashes when using delta. We don't
-	// want to do this when using SOTW so we can avoid unnecessary
-	// computational cost if not using delta.
-	if len(info.deltaWatches) == 0 {
-		return nil
-	}
-
-	err := snapshot.ConstructVersionMap()
+// SetSnapshot updates a snapshot for a node.
+func (cache *snapshotCache) SetSnapshot(ctx context.Context, node string, snapshot ResourceSnapshot) error {
+	unlock, err := cache.lockResponses(ctx, node)
 	if err != nil {
 		return err
 	}
-
-	replyWatch := func(watch DeltaResponseWatch, id int64) error {
-		resp := createDeltaResponse(snapshot, watch, false)
-		// If we receive a nil response here, that means there has been no state change
-		// so we don't want to respond or remove any existing resource watches
-		if resp == nil {
-			return nil
-		}
-
-		err := cache.respondDelta(ctx, watch, resp)
-		if err != nil {
-			return err
-		}
-		delete(info.deltaWatches, id)
+	defer unlock()
+	cache.mu.Lock()
+	cache.log.Debugf("setting snapshot for node %s", node)
+	cache.snapshots[node] = snapshot
+	info, ok := cache.status[node]
+	if !ok {
+		cache.mu.Unlock()
 		return nil
 	}
+	info.mu.Lock()
+	info.snapshotCleared = false
+	sotw := cache.collectSotwResponses(info, snapshot)
+	delta, prepareErr := cache.collectDeltaResponses(info, snapshot)
+	info.responsesInFlight += len(sotw) + len(delta)
+	info.mu.Unlock()
+	cache.mu.Unlock()
+	if err := cache.sendResponses(ctx, node, info, sotw, delta); err != nil {
+		return err
+	}
+	return prepareErr
+}
 
-	// If ADS is enabled we need to order response delta watches so we guarantee
-	// sending them in the correct order. Go's default implementation
-	// of maps are randomized order when ranged over.
+func (cache *snapshotCache) collectSotwResponses(info *statusInfo, snapshot ResourceSnapshot) []pendingSotwResponse {
+	var pending []pendingSotwResponse
+	collect := func(id int64, watch ResponseWatch) {
+		if snapshot.GetVersion(watch.Request.GetTypeUrl()) == watch.Request.GetVersionInfo() {
+			return
+		}
+		resp, declined := createResponse(snapshot, watch, cache.ads, cache.subscriptionFilteredResponses)
+		if declined {
+			cache.log.Debugf("ADS mode: holding open watch %d %s %v at version %q: the snapshot has resources the client has not named", id, watch.Request.GetTypeUrl(), watch.Request.GetResourceNames(), snapshot.GetVersion(watch.Request.GetTypeUrl()))
+		}
+		if resp != nil {
+			pending = append(pending, pendingSotwResponse{id: id, watch: watch, response: resp})
+			delete(info.watches, id)
+		}
+	}
+	if cache.ads {
+		info.orderResponseWatches()
+		for _, key := range info.orderedWatches {
+			collect(key.ID, info.watches[key.ID])
+		}
+	} else {
+		for id, watch := range info.watches {
+			collect(id, watch)
+		}
+	}
+	return pending
+}
+
+func (cache *snapshotCache) collectDeltaResponses(info *statusInfo, snapshot ResourceSnapshot) ([]pendingDeltaResponse, error) {
+	if len(info.deltaWatches) == 0 {
+		return nil, nil
+	}
+	if err := snapshot.ConstructVersionMap(); err != nil {
+		return nil, err
+	}
+	var pending []pendingDeltaResponse
+	collect := func(id int64, watch DeltaResponseWatch) {
+		if resp := createDeltaResponse(snapshot, watch, false); resp != nil {
+			pending = append(pending, pendingDeltaResponse{id: id, watch: watch, response: resp})
+			delete(info.deltaWatches, id)
+		}
+	}
 	if cache.ads {
 		info.orderResponseDeltaWatches()
 		for _, key := range info.orderedDeltaWatches {
-			watch := info.deltaWatches[key.ID]
-			err := replyWatch(watch, key.ID)
-			if err != nil {
-				return err
-			}
+			collect(key.ID, info.deltaWatches[key.ID])
 		}
 	} else {
 		for id, watch := range info.deltaWatches {
-			err := replyWatch(watch, id)
-			if err != nil {
-				return err
-			}
+			collect(id, watch)
 		}
 	}
-	return nil
+	return pending, nil
 }
 
 // GetSnapshot gets the snapshot for a node, and returns an error if not found.
@@ -440,7 +409,7 @@ func (cache *snapshotCache) ClearSnapshot(node string) {
 
 // removeClearedStatus requires both cache.mu and info.mu to be held for writing.
 func (cache *snapshotCache) removeClearedStatus(node string, info *statusInfo) {
-	if info.snapshotCleared && len(info.watches) == 0 && len(info.deltaWatches) == 0 {
+	if info.snapshotCleared && info.responsesInFlight == 0 && len(info.watches) == 0 && len(info.deltaWatches) == 0 {
 		delete(cache.status, node)
 	}
 }
@@ -448,10 +417,20 @@ func (cache *snapshotCache) removeClearedStatus(node string, info *statusInfo) {
 // CreateWatch returns a watch for an xDS request.  A nil function may be
 // returned if an error occurs.
 func (cache *snapshotCache) CreateWatch(request *Request, sub Subscription, value chan Response) (func(), error) {
-	nodeID := cache.hash.ID(request.GetNode())
-
 	cache.mu.Lock()
-	defer cache.mu.Unlock()
+	cancel, watch, resp := cache.prepareWatch(request, sub, value)
+	cache.mu.Unlock()
+	if resp != nil {
+		if err := cache.respond(context.Background(), watch, resp); err != nil {
+			return nil, fmt.Errorf("failed to send the response: %w", err)
+		}
+	}
+	return cancel, nil
+}
+
+// prepareWatch requires cache.mu to be held for writing.
+func (cache *snapshotCache) prepareWatch(request *Request, sub Subscription, value chan Response) (func(), ResponseWatch, *RawResponse) {
+	nodeID := cache.hash.ID(request.GetNode())
 
 	info, ok := cache.status[nodeID]
 	if !ok {
@@ -463,23 +442,25 @@ func (cache *snapshotCache) CreateWatch(request *Request, sub Subscription, valu
 	info.setLastWatchRequestTime(time.Now())
 
 	createWatch := func(watch ResponseWatch) func() {
+		done := make(chan struct{})
+		watch.done = done
 		watchID := cache.nextWatchID()
 		cache.log.Debugf("open watch %d for %s %v from nodeID %q, version %q", watchID, request.GetTypeUrl(), sub.SubscribedResources(), nodeID, request.GetVersionInfo())
 		info.mu.Lock()
 		info.watches[watchID] = watch
 		info.mu.Unlock()
-		return cache.cancelWatch(nodeID, watchID)
+		return cache.cancelWatch(nodeID, watchID, done)
 	}
 
 	if !sub.IsWildcard() && len(sub.SubscribedResources()) == 0 {
-		return func() {}, nil
+		return func() {}, ResponseWatch{}, nil
 	}
 
 	watch := ResponseWatch{Request: request, Response: value, subscription: sub, fullStateResponses: ResourceRequiresFullStateInSotw(request.GetTypeUrl())}
 
 	snapshot, exists := cache.snapshots[nodeID]
 	if !exists {
-		return createWatch(watch), nil
+		return createWatch(watch), watch, nil
 	}
 
 	resp, declined := createResponse(snapshot, watch, cache.ads, cache.subscriptionFilteredResponses)
@@ -487,15 +468,10 @@ func (cache *snapshotCache) CreateWatch(request *Request, sub Subscription, valu
 		cache.log.Debugf("ADS mode: retaining watch for request %s %v: the snapshot has resources the client has not named", request.GetTypeUrl(), request.GetResourceNames())
 	}
 	if resp != nil {
-		if err := cache.respond(context.Background(), watch, resp); err != nil {
-			cache.log.Errorf("failed to send a response for %s%v to nodeID %q: %s", request.GetTypeUrl(),
-				sub.SubscribedResources(), nodeID, err)
-			return nil, fmt.Errorf("failed to send the response: %w", err)
-		}
-		return func() {}, nil
+		return func() {}, watch, resp
 	}
 
-	return createWatch(watch), nil
+	return createWatch(watch), watch, nil
 }
 
 func (cache *snapshotCache) nextWatchID() int64 {
@@ -503,8 +479,10 @@ func (cache *snapshotCache) nextWatchID() int64 {
 }
 
 // cancellation function for cleaning stale watches.
-func (cache *snapshotCache) cancelWatch(nodeID string, watchID int64) func() {
+func (cache *snapshotCache) cancelWatch(nodeID string, watchID int64, done chan struct{}) func() {
+	var once sync.Once
 	return func() {
+		once.Do(func() { close(done) })
 		// The common case only needs the read lock: cancels must not serialize
 		// against every SetSnapshot for the sake of the rare cleared node.
 		cache.mu.RLock()
@@ -705,6 +683,8 @@ func (cache *snapshotCache) respond(ctx context.Context, watch ResponseWatch, re
 	select {
 	case watch.Response <- response:
 		return nil
+	case <-watch.done:
+		return nil
 	case <-ctx.Done():
 		return context.Canceled
 	}
@@ -712,11 +692,24 @@ func (cache *snapshotCache) respond(ctx context.Context, watch ResponseWatch, re
 
 // CreateDeltaWatch returns a watch for a delta xDS request which implements the Simple SnapshotCache.
 func (cache *snapshotCache) CreateDeltaWatch(request *DeltaRequest, sub Subscription, value chan DeltaResponse) (func(), error) {
+	cache.mu.Lock()
+	cancel, watch, resp, err := cache.prepareDeltaWatch(request, sub, value)
+	cache.mu.Unlock()
+	if err != nil {
+		return cancel, err
+	}
+	if resp != nil {
+		if err := cache.respondDelta(context.Background(), watch, resp); err != nil {
+			return func() {}, fmt.Errorf("responding: %w", err)
+		}
+	}
+	return cancel, nil
+}
+
+// prepareDeltaWatch requires cache.mu to be held for writing.
+func (cache *snapshotCache) prepareDeltaWatch(request *DeltaRequest, sub Subscription, value chan DeltaResponse) (func(), DeltaResponseWatch, *RawDeltaResponse, error) {
 	nodeID := cache.hash.ID(request.GetNode())
 	t := request.GetTypeUrl()
-
-	cache.mu.Lock()
-	defer cache.mu.Unlock()
 
 	info, ok := cache.status[nodeID]
 	if !ok {
@@ -734,17 +727,12 @@ func (cache *snapshotCache) CreateDeltaWatch(request *DeltaRequest, sub Subscrip
 	if exists {
 		err := snapshot.ConstructVersionMap()
 		if err != nil {
-			return func() {}, fmt.Errorf("computing version map: %w", err)
+			return func() {}, watch, nil, fmt.Errorf("computing version map: %w", err)
 		}
 
 		resp := createDeltaResponse(snapshot, watch, sub.IsWildcard() && request.ResponseNonce == "")
 		if resp != nil {
-			err := cache.respondDelta(context.Background(), watch, resp)
-			if err != nil {
-				cache.log.Errorf("failed to respond with delta response: %s", err)
-				return func() {}, fmt.Errorf("responding: %w", err)
-			}
-			return func() {}, nil
+			return func() {}, watch, resp, nil
 		}
 
 		// We did not reply, fallthrough to watch tracking
@@ -760,8 +748,10 @@ func (cache *snapshotCache) CreateDeltaWatch(request *DeltaRequest, sub Subscrip
 		cache.log.Infof("open delta watch ID:%d for %s Resources:%v from nodeID: %q", watchID, t, sub.SubscribedResources(), nodeID)
 	}
 
+	done := make(chan struct{})
+	watch.done = done
 	info.setDeltaResponseWatch(watchID, watch)
-	return cache.cancelDeltaWatch(nodeID, watchID), nil
+	return cache.cancelDeltaWatch(nodeID, watchID, done), watch, nil, nil
 }
 
 func createDeltaResponse(snapshot ResourceSnapshot, watch DeltaResponseWatch, replyIfEmpty bool) *RawDeltaResponse {
@@ -847,6 +837,8 @@ func (cache *snapshotCache) respondDelta(ctx context.Context, watch DeltaRespons
 	select {
 	case watch.Response <- resp:
 		return nil
+	case <-watch.done:
+		return nil
 	case <-ctx.Done():
 		return context.Canceled
 	}
@@ -857,8 +849,10 @@ func (cache *snapshotCache) nextDeltaWatchID() int64 {
 }
 
 // cancellation function for cleaning stale delta watches.
-func (cache *snapshotCache) cancelDeltaWatch(nodeID string, watchID int64) func() {
+func (cache *snapshotCache) cancelDeltaWatch(nodeID string, watchID int64, done chan struct{}) func() {
+	var once sync.Once
 	return func() {
+		once.Do(func() { close(done) })
 		cache.mu.RLock()
 		var idleCleared bool
 		if info, ok := cache.status[nodeID]; ok {

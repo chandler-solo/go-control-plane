@@ -121,3 +121,24 @@ newly added cluster or route reaches the client when it re-requests with the
 new name after its CDS or LDS changes, which Envoy does on every such change.
 When the legacy policy holds a response, the cache logs it at debug level with
 the watch, type and names, so a withheld named type can be found in logs.
+
+## Response delivery and cancellation
+
+Snapshot responses are prepared while holding the cache and node-status locks,
+then sent after both locks are released. A full response channel can still
+block its calling `CreateWatch`, `CreateDeltaWatch`, or `SetSnapshot`, but it
+does not prevent other nodes from publishing snapshots or creating watches.
+Heartbeats follow the same rule. Publications and heartbeats remain serialized
+per node, preserving ADS response order. A waiting publication can be canceled
+through its context before it installs a snapshot.
+
+Selected watches are removed from open-watch counts before delivery. If a send
+fails, unsent watches are restored unless the caller canceled them; snapshot
+installation is not rolled back. Clearing a snapshot retains status while a
+delivery is in flight so failure cannot orphan its watch.
+
+Canceling a registered watch interrupts a blocked send. Cancellation never
+closes the caller's response channel; a response already ready for delivery
+can race with cancellation. Callers must not close that channel while a sender
+can still use it. The server cancels watches and stops reading their channels
+without closing them.
