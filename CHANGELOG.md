@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Retain new named ADS watches when the current snapshot contains unrequested resources, so a later aligned snapshot can answer them.
+
 ## Release v0.11.0
 
 ### Added
