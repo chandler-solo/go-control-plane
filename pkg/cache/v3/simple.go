@@ -490,15 +490,34 @@ func (cache *snapshotCache) nextWatchID() int64 {
 // cancellation function for cleaning stale watches.
 func (cache *snapshotCache) cancelWatch(nodeID string, watchID int64) func() {
 	return func() {
-		// uses the cache mutex
-		cache.mu.Lock()
-		defer cache.mu.Unlock()
+		// The common case only needs the read lock: cancels must not serialize
+		// against every SetSnapshot for the sake of the rare cleared node.
+		cache.mu.RLock()
+		var idleCleared bool
 		if info, ok := cache.status[nodeID]; ok {
 			info.mu.Lock()
 			delete(info.watches, watchID)
-			cache.removeClearedStatus(nodeID, info)
+			idleCleared = info.snapshotCleared && len(info.watches) == 0 && len(info.deltaWatches) == 0
 			info.mu.Unlock()
 		}
+		cache.mu.RUnlock()
+		if idleCleared {
+			cache.dropClearedStatus(nodeID)
+		}
+	}
+}
+
+// dropClearedStatus removes a node's status if it is still cleared and has no
+// watches. It re-checks under the write lock because a SetSnapshot or a new
+// watch can arrive between a cancel's read-locked check and this call; either
+// makes the status live again and it must stay.
+func (cache *snapshotCache) dropClearedStatus(nodeID string) {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	if info, ok := cache.status[nodeID]; ok {
+		info.mu.Lock()
+		cache.removeClearedStatus(nodeID, info)
+		info.mu.Unlock()
 	}
 }
 
@@ -811,13 +830,17 @@ func (cache *snapshotCache) nextDeltaWatchID() int64 {
 // cancellation function for cleaning stale delta watches.
 func (cache *snapshotCache) cancelDeltaWatch(nodeID string, watchID int64) func() {
 	return func() {
-		cache.mu.Lock()
-		defer cache.mu.Unlock()
+		cache.mu.RLock()
+		var idleCleared bool
 		if info, ok := cache.status[nodeID]; ok {
 			info.mu.Lock()
 			delete(info.deltaWatches, watchID)
-			cache.removeClearedStatus(nodeID, info)
+			idleCleared = info.snapshotCleared && len(info.watches) == 0 && len(info.deltaWatches) == 0
 			info.mu.Unlock()
+		}
+		cache.mu.RUnlock()
+		if idleCleared {
+			cache.dropClearedStatus(nodeID)
 		}
 	}
 }

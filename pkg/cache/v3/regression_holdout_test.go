@@ -145,3 +145,47 @@ func TestClearSnapshotRemovesStatusAfterLastCancellation(t *testing.T) {
 		})
 	}
 }
+
+// A node cleared with two watches open keeps its status through the first
+// cancel; a SetSnapshot in between makes the status live again, so the second
+// cancel must keep it too. This is the re-check the write-lock upgrade does
+// after the cancel's read-locked pass.
+func TestCancelAfterRepublishKeepsStatus(t *testing.T) {
+	ctx := context.Background()
+	c := cache.NewSnapshotCache(true, kgwHash{}, nil)
+	if err := c.SetSnapshot(ctx, kgwNode, kgwEDS(t, "v1", cla("a", 1))); err != nil {
+		t.Fatal(err)
+	}
+	req := &discovery.DiscoveryRequest{TypeUrl: rsrc.EndpointType, ResourceNames: []string{"a"}, VersionInfo: "v1"}
+	sub := stream.NewSotwSubscription([]string{"a"}, false)
+	sub.SetReturnedResources(map[string]string{"a": "v1"})
+	cancel1, err := c.CreateWatch(req, sub, make(chan cache.Response, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel2, err := c.CreateWatch(req, sub, make(chan cache.Response, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.ClearSnapshot(kgwNode)
+
+	cancel1()
+	if info := c.GetStatusInfo(kgwNode); info == nil || info.GetNumWatches() != 1 {
+		t.Fatalf("status must survive a cancel that leaves a watch open, got %v", info)
+	}
+
+	// Republishing makes the node live again before the last cancel.
+	if err := c.SetSnapshot(ctx, kgwNode, kgwEDS(t, "v2", cla("a", 2))); err != nil {
+		t.Fatal(err)
+	}
+	cancel2()
+	if info := c.GetStatusInfo(kgwNode); info == nil {
+		t.Fatal("status must be kept when a snapshot was published after the clear")
+	}
+
+	// Clearing again with no watches open drops it at once.
+	c.ClearSnapshot(kgwNode)
+	if info := c.GetStatusInfo(kgwNode); info != nil {
+		t.Fatalf("status must be removed by a clear with no open watches, got %v", info)
+	}
+}
