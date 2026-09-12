@@ -82,6 +82,16 @@ type SnapshotCache interface {
 	//
 	// This method will cause the server to respond to all open watches, for which
 	// the version differs from the snapshot version.
+	//
+	// Contract: the snapshot is installed first and responses are sent after the
+	// cache and node locks are released, serialized per node so ADS order is
+	// kept. A returned error after installation (a canceled context or a
+	// blocked response channel) means some responses were not sent; the
+	// snapshot stays installed and the unsent watches stay registered, so the
+	// next call answers them. A caller whose context is already canceled still
+	// installs when no send is pending. Canceling a watch interrupts a send
+	// blocked on its channel; a response already handed to the channel is not
+	// withdrawn.
 	SetSnapshot(ctx context.Context, node string, snapshot ResourceSnapshot) error
 
 	// GetSnapshots gets the snapshot for a node.
