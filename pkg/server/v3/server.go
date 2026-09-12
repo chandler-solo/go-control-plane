@@ -171,6 +171,12 @@ func WithNackDamping() config.XDSOption {
 	return sotw.WithNackDamping()
 }
 
+// WithStaleNonceSubscriptionUpdates admits subscription changes on stale SotW
+// requests. It is disabled by default and does not affect delta streams.
+func WithStaleNonceSubscriptionUpdates() config.XDSOption {
+	return sotw.WithStaleNonceSubscriptionUpdates()
+}
+
 // NewServer creates handlers from a config watcher and callbacks.
 func NewServer(ctx context.Context, config cache.Cache, callbacks Callbacks, opts ...config.XDSOption) Server {
 	return NewServerAdvanced(rest.NewServer(config, callbacks),

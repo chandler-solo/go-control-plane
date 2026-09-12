@@ -11,6 +11,9 @@ type Opts struct {
 	// NackDamping parks matching SotW NACKs at the last sent version.
 	NackDamping bool
 
+	// StaleNonceSubscriptionUpdates admits SotW subscription changes on stale requests.
+	StaleNonceSubscriptionUpdates bool
+
 	Logger log.Logger
 
 	// If true, deactivate legacy wildcard mode for all resource types

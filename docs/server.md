@@ -141,3 +141,20 @@ by the client's own subscription changes. Second, with damping on the server
 carries the last nonce and version onto the watch that replaces a completed
 one, so a later request with an older nonce is treated as stale even though no
 response has been sent since; without damping such a request is accepted.
+
+## Subscription changes on stale SotW requests
+
+`server.WithStaleNonceSubscriptionUpdates()` is an experimental opt-in policy
+for SotW streams, including both ADS modes. The default policy ignores requests
+with stale nonces. With the option enabled, their resource-name subscriptions
+are applied and a replacement cache watch is created.
+
+A stale request does not acknowledge or reject the latest response. The cache
+receives a cloned request with the last sent version and no error detail, while
+`OnStreamRequest` retains the client's original request. Newly subscribed
+resources and later snapshot versions can be delivered; stale accepted versions
+do not themselves trigger replay. The option also preserves subscription
+shrinks and can be combined with `WithNackDamping()`. Delta streams are unchanged.
+
+This policy is disabled by default pending the protocol discussion in
+[Envoy #10363](https://github.com/envoyproxy/envoy/issues/10363).
