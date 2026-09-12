@@ -156,5 +156,16 @@ resources and later snapshot versions can be delivered; stale accepted versions
 do not themselves trigger replay. The option also preserves subscription
 shrinks and can be combined with `WithNackDamping()`. Delta streams are unchanged.
 
+One consequence should be stated plainly, because it departs from the text
+quoted in that discussion, which says a server should not send a response for a
+request with a stale nonce. When a stale request adds a name the snapshot
+already holds, the cloned request carries the last sent version and a name not
+yet returned, so the cache answers it at once with that resource at the current
+version. That is a response to a stale-nonce request. It is deliberate: the
+client asked for the resource and Envoy accepts a response regardless of the
+nonce it last saw, acknowledging it with the new nonce. A stale request that
+only removes names produces no response; the shrink is applied to the
+subscription and shows in the next published version.
+
 This policy is disabled by default pending the protocol discussion in
 [Envoy #10363](https://github.com/envoyproxy/envoy/issues/10363).
