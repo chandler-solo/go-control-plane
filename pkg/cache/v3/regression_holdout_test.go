@@ -25,7 +25,7 @@ import (
 	"github.com/envoyproxy/go-control-plane/pkg/server/stream/v3"
 )
 
-func TestClearSnapshotOrphansParkedWatchOnPin(t *testing.T) {
+func TestClearSnapshotRetainsParkedWatch(t *testing.T) {
 	ctx := context.Background()
 	c := cache.NewSnapshotCache(true, kgwHash{}, nil)
 	if err := c.SetSnapshot(ctx, kgwNode, kgwEDS(t, "v1", cla("a", 1))); err != nil {
@@ -39,36 +39,109 @@ func TestClearSnapshotOrphansParkedWatchOnPin(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(cancel)
-	expectSilence(t, ch, "equal-version request parks")
-	if n := c.GetStatusInfo(kgwNode).GetNumWatches(); n != 1 {
-		t.Fatalf("expected 1 parked watch, got %d", n)
+	c.ClearSnapshot(kgwNode)
+	if _, err := c.GetSnapshot(kgwNode); err == nil {
+		t.Fatal("cleared snapshot is still available")
 	}
-
+	if info := c.GetStatusInfo(kgwNode); info == nil || info.GetNumWatches() != 1 {
+		t.Fatalf("parked watch lost on clear: %v", info)
+	}
+	expectSilence(t, ch, "clear does not answer or close the watch")
+	if err := c.SetSnapshot(ctx, kgwNode, kgwEDS(t, "v2", cla("a", 2))); err != nil {
+		t.Fatal(err)
+	}
+	got := expectResponse(t, ch, "next snapshot answers the retained watch")
+	if got.GetResponseVersion() != "v2" || len(got.GetReturnedResources()) != 1 {
+		t.Fatalf("unexpected response: %v", got)
+	}
+	if _, ok := got.GetReturnedResources()["a"]; !ok {
+		t.Fatal("response omitted a")
+	}
+	cancel()
+	if info := c.GetStatusInfo(kgwNode); info == nil || info.GetNumWatches() != 0 {
+		t.Fatalf("republished node status was removed or watch was retained: %v", info)
+	}
 	c.ClearSnapshot(kgwNode)
 	if info := c.GetStatusInfo(kgwNode); info != nil {
-		t.Fatalf("status survived ClearSnapshot with %d watches", info.GetNumWatches())
+		t.Fatal("clear retained status with no watches")
 	}
-	expectSilence(t, ch, "ClearSnapshot does not answer or close the parked watch")
+}
 
-	// A new snapshot for the node has no memory of the parked watch.
-	if err := c.SetSnapshot(ctx, kgwNode, kgwEDS(t, "v2", cla("a", 2))); err != nil {
+func TestClearSnapshotRetainsDeltaWatch(t *testing.T) {
+	c := cache.NewSnapshotCache(true, kgwHash{}, nil)
+	ch := make(chan cache.DeltaResponse, 1)
+	cancel, err := c.CreateDeltaWatch(&discovery.DeltaDiscoveryRequest{TypeUrl: rsrc.EndpointType, ResourceNamesSubscribe: []string{"a"}}, stream.NewDeltaSubscription([]string{"a"}, nil, nil, false), ch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cancel)
+	c.ClearSnapshot(kgwNode)
+	if info := c.GetStatusInfo(kgwNode); info == nil || info.GetNumDeltaWatches() != 1 {
+		t.Fatalf("delta watch lost on clear: %v", info)
+	}
+	if err := c.SetSnapshot(context.Background(), kgwNode, kgwEDS(t, "v2", cla("a", 2))); err != nil {
 		t.Fatal(err)
 	}
 	select {
 	case got := <-ch:
-		t.Fatalf("orphaned watch was answered (%v); watch retention changed, update this expectation", got.GetReturnedResources())
-	case <-time.After(300 * time.Millisecond):
+		version, err := got.GetSystemVersion()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if version != "v2" || len(got.GetNextVersionMap()) != 1 {
+			t.Fatalf("unexpected delta response: %v", got)
+		}
+		if _, ok := got.GetNextVersionMap()["a"]; !ok {
+			t.Fatal("delta response omitted a")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("delta watch was not answered after clear")
 	}
-	// SetSnapshot creates no status of its own; only a request does.
-	if info := c.GetStatusInfo(kgwNode); info != nil && info.GetNumWatches() != 0 {
-		t.Fatalf("new status carries %d watches; expected the old waiter to be orphaned", info.GetNumWatches())
+}
+
+func TestClearSnapshotRemovesStatusAfterLastCancellation(t *testing.T) {
+	for _, deltaFirst := range []bool{false, true} {
+		name := "sotw-first"
+		if deltaFirst {
+			name = "delta-first"
+		}
+		t.Run(name, func(t *testing.T) {
+			c := cache.NewSnapshotCache(true, kgwHash{}, nil)
+			sotwCancel, err := c.CreateWatch(&discovery.DiscoveryRequest{TypeUrl: rsrc.EndpointType, ResourceNames: []string{"a"}}, stream.NewSotwSubscription([]string{"a"}, false), make(chan cache.Response, 1))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(sotwCancel)
+			deltaCancel, err := c.CreateDeltaWatch(&discovery.DeltaDiscoveryRequest{TypeUrl: rsrc.EndpointType, ResourceNamesSubscribe: []string{"a"}}, stream.NewDeltaSubscription([]string{"a"}, nil, nil, false), make(chan cache.DeltaResponse, 1))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(deltaCancel)
+			c.ClearSnapshot(kgwNode)
+			first, last := sotwCancel, deltaCancel
+			if deltaFirst {
+				first, last = last, first
+			}
+			first()
+			info := c.GetStatusInfo(kgwNode)
+			if info == nil || info.GetNumWatches()+info.GetNumDeltaWatches() != 1 {
+				t.Fatalf("first cancellation lost remaining watch: %v", info)
+			}
+			last()
+			if c.GetStatusInfo(kgwNode) != nil {
+				t.Fatal("last cancellation retained cleared status")
+			}
+			// Cancellation is idempotent, including after a fresh status is created.
+			fresh, err := c.CreateWatch(&discovery.DiscoveryRequest{TypeUrl: rsrc.EndpointType, ResourceNames: []string{"a"}}, stream.NewSotwSubscription([]string{"a"}, false), make(chan cache.Response, 1))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(fresh)
+			first()
+			last()
+			if info := c.GetStatusInfo(kgwNode); info == nil || info.GetNumWatches() != 1 {
+				t.Fatalf("old cancellation removed new watch: %v", info)
+			}
+		})
 	}
-	// The server-side recovery path is a new request from the client.
-	ch2 := make(chan cache.Response, 1)
-	cancel2, err := c.CreateWatch(&discovery.DiscoveryRequest{TypeUrl: rsrc.EndpointType, ResourceNames: []string{"a"}, VersionInfo: "v1"}, sub, ch2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(cancel2)
-	expectResponse(t, ch2, "a fresh request sees v2")
 }

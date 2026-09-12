@@ -73,6 +73,9 @@ type statusInfo struct {
 	deltaWatches        map[int64]DeltaResponseWatch
 	orderedDeltaWatches keys
 
+	// snapshotCleared removes retained status once its last watch is canceled.
+	snapshotCleared bool
+
 	// the timestamp of the last watch request
 	lastWatchRequestTime time.Time
 
