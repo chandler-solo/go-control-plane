@@ -19,6 +19,7 @@ import (
 	"reflect"
 	"slices"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -585,36 +586,62 @@ func TestLinearCancel(t *testing.T) {
 	checkWatchCount(t, c, "b", 0)
 }
 
-// TODO(mattklein123): This test requires GOMAXPROCS or -parallel >= 100. This should be
-// rewritten to not require that. This is not the case in the GH actions environment.
+// Workers run on goroutines rather than parallel subtests. A subtest that calls
+// t.Parallel() is capped by -parallel, which defaults to GOMAXPROCS, and every
+// watcher below waits for an update performed by a different worker. With a cap
+// below 2*n a batch of watchers can hold every slot while the updates they wait
+// for have not been scheduled, and the watch then times out. That is what made
+// this test fail intermittently whenever the package was run under the race
+// detector, where the slower workers make the batching easy to hit. Goroutines
+// are not capped that way, so the concurrency under test is unchanged while the
+// dependency on the scheduler is gone.
+//
+// Responses are verified after every worker has finished, which is
+// deterministic: UpdateResource notifies matching watches synchronously, under
+// the cache lock, so once the updates have returned each watch response is
+// already queued on its buffered channel. Verifying on the test goroutine also
+// keeps the require and assert calls where the testing package allows them.
 func TestLinearConcurrentSetWatch(t *testing.T) {
 	c := NewLinearCache(testType)
 	n := 50
+
+	responses := make([]chan Response, 2*n)
+	errs := make(chan error, 2*n)
+	var wg sync.WaitGroup
+
 	for i := 0; i < 2*n; i++ {
-		func(i int) {
-			t.Run(fmt.Sprintf("worker%d", i), func(t *testing.T) {
-				t.Parallel()
-				id := strconv.Itoa(i)
-				if i%2 == 0 {
-					t.Logf("update resource %q", id)
-					require.NoError(t, c.UpdateResource(id, testResource(id)))
-				} else {
-					id2 := strconv.Itoa(i - 1)
-					t.Logf("request resources %q and %q", id, id2)
-					value := make(chan Response, 1)
-					req := &Request{
-						// Only expect one to become stale
-						ResourceNames: []string{id, id2},
-						VersionInfo:   "0",
-						TypeUrl:       testType,
-					}
-					_, err := c.CreateWatch(req, subFromRequest(req), value)
-					require.NoError(t, err)
-					// wait until all updates apply
-					verifyResponse(t, value, "", 1)
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			id := strconv.Itoa(i)
+			if i%2 == 0 {
+				if err := c.UpdateResource(id, testResource(id)); err != nil {
+					errs <- fmt.Errorf("update resource %q: %w", id, err)
 				}
-			})
+				return
+			}
+			value := make(chan Response, 1)
+			responses[i] = value
+			req := &Request{
+				// Only expect one to become stale
+				ResourceNames: []string{id, strconv.Itoa(i - 1)},
+				VersionInfo:   "0",
+				TypeUrl:       testType,
+			}
+			if _, err := c.CreateWatch(req, subFromRequest(req), value); err != nil {
+				errs <- fmt.Errorf("create watch for %q: %w", id, err)
+			}
 		}(i)
+	}
+
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+
+	for i := 1; i < 2*n; i += 2 {
+		verifyResponse(t, responses[i], "", 1)
 	}
 }
 
