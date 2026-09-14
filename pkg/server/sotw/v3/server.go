@@ -74,6 +74,13 @@ func WithNackDamping() config.XDSOption {
 	return func(o *config.Opts) { o.NackDamping = true }
 }
 
+// WithStaleNonceSubscriptionUpdates admits subscription changes on stale SotW
+// requests without treating them as acknowledgments or rejections. It is disabled
+// by default pending clarification of the protocol's stale-nonce policy.
+func WithStaleNonceSubscriptionUpdates() config.XDSOption {
+	return func(o *config.Opts) { o.StaleNonceSubscriptionUpdates = true }
+}
+
 // WithLogger configures the server logger. Defaults to no logging.
 func WithLogger(logger log.Logger) config.XDSOption {
 	return func(o *config.Opts) {

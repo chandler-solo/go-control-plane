@@ -85,6 +85,14 @@ func (w *watch) dampNack(req *discovery.DiscoveryRequest) *discovery.DiscoveryRe
 	return cloned
 }
 
+func (w *watch) staleSubscriptionRequest(req *discovery.DiscoveryRequest) *discovery.DiscoveryRequest {
+	cloned := proto.Clone(req).(*discovery.DiscoveryRequest)
+	// The stale request does not acknowledge or reject the current response.
+	cloned.VersionInfo = w.lastVersion
+	cloned.ErrorDetail = nil
+	return cloned
+}
+
 // close cancels an open watch.
 func (w *watch) close() {
 	if w.cancel != nil {

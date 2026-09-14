@@ -4,6 +4,8 @@
 
 ### Added
 
+- Added an experimental opt-in policy to apply SotW subscription changes on stale-nonce requests.
+
 - Added opt-in SotW NACK damping to wait for a new snapshot version after a matching rejection.
 
 - Added snapshot-cache constructor options for ADS and opt-in subscription-filtered named responses.

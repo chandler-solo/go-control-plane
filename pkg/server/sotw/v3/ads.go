@@ -83,8 +83,9 @@ func (s *server) processADS(sw *streamWrapper, reqCh chan *discovery.DiscoveryRe
 
 			var subscription stream.Subscription
 			w, ok := sw.watches.responders[typeURL]
+			stale := ok && w.nonce != "" && req.GetResponseNonce() != w.nonce
 			if ok {
-				if w.nonce != "" && req.GetResponseNonce() != w.nonce {
+				if stale && !s.opts.StaleNonceSubscriptionUpdates {
 					// The request does not match the stream nonce, ignore it as per
 					// https://www.envoyproxy.io/docs/envoy/v1.28.0/api-docs/xds_protocol#resource-updates
 					// Ignore this request and wait for the next one
@@ -111,7 +112,9 @@ func (s *server) processADS(sw *streamWrapper, reqCh chan *discovery.DiscoveryRe
 			}
 
 			cacheReq := req
-			if s.opts.NackDamping {
+			if stale {
+				cacheReq = w.staleSubscriptionRequest(req)
+			} else if s.opts.NackDamping {
 				cacheReq = w.dampNack(req)
 			}
 			cancel, err := s.cache.CreateWatch(cacheReq, subscription, respChan)
@@ -123,7 +126,7 @@ func (s *server) processADS(sw *streamWrapper, reqCh chan *discovery.DiscoveryRe
 				response: respChan,
 				sub:      subscription,
 			}
-			if s.opts.NackDamping && w != nil {
+			if (s.opts.NackDamping || s.opts.StaleNonceSubscriptionUpdates) && w != nil {
 				next.nonce = w.nonce
 				next.lastVersion = w.lastVersion
 			}
