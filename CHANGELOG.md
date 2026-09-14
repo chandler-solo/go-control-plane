@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Added snapshot-cache constructor options for ADS and opt-in subscription-filtered named responses.
+
 ### Fixed
 
 - Preserve open SotW and delta watches when clearing snapshots, and remove cleared status after the last watch is canceled. `GetStatusInfo` now stays non-nil for a cleared node while its watches are open.

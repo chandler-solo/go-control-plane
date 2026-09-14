@@ -87,3 +87,37 @@ nil status after `ClearSnapshot` as the signal that a node is gone should check
 `GetSnapshot` for the absent snapshot instead, or cancel the streams first.
 Cancelling a watch takes only the read lock unless it is the last watch of a
 cleared node, so the retained status does not slow down watch churn.
+
+## Subscription-filtered ADS responses
+
+The default ADS policy waits until every resource in a snapshot type is named
+by the client. When snapshots include resources that a client will never
+request, its named responses can remain blocked across revisions. To answer
+with just the client's subscribed resources, opt in when constructing the cache:
+
+```go
+c := cache.NewSnapshotCacheWithOptions(cache.IDHash{}, nil,
+    cache.WithADS(), cache.WithSubscriptionFilteredResponses())
+```
+
+The option affects immediate and parked named SotW ADS watches. Wildcard
+responses still include all resources. Snapshot maps are not modified, and
+equal-version requests still return newly subscribed resources. Empty
+subscriptions receive no response and register no watch. Delta watches and
+REST fetches are unchanged.
+
+`NewSnapshotCache(ads, hash, logger)` keeps its signature and default policy.
+`NewSnapshotCacheWithOptions(hash, logger)` defaults to non-ADS mode; use
+`WithADS()` alone to select the legacy ADS policy. Filtering is opt-in because
+some consumers may use the legacy delay to coordinate resource warming.
+
+What the option gives up is that coordination. The legacy policy answers a
+named type only once the client has named every resource of that type in the
+snapshot, which makes Envoy wait for its CDS or LDS to name every cluster or
+route before any endpoints or routes arrive. With filtering, a client that
+names a resource absent from the snapshot is answered without it and keeps
+waiting for that name; a resource it has not named is never sent to it; and a
+newly added cluster or route reaches the client when it re-requests with the
+new name after its CDS or LDS changes, which Envoy does on every such change.
+When the legacy policy holds a response, the cache logs it at debug level with
+the watch, type and names, so a withheld named type can be found in logs.

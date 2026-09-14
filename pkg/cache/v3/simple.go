@@ -16,7 +16,6 @@ package cache
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -59,12 +58,18 @@ type ResourceSnapshot interface {
 
 // SnapshotCache is a snapshot-based cache that maintains a single versioned
 // snapshot of responses per node. SnapshotCache consistently replies with the
-// latest snapshot. For the protocol to work correctly in ADS mode, EDS/RDS
+// latest snapshot. By default in ADS mode, EDS/RDS
 // requests are responded only when all resources in the snapshot xDS response
 // are named as part of the request. It is expected that the CDS response names
 // all EDS clusters, and the LDS response names all RDS routes in a snapshot,
 // to ensure that Envoy makes the request for all EDS clusters or RDS routes
-// eventually.
+// eventually. WithSubscriptionFilteredResponses instead answers named ADS
+// requests with only their subscribed resources. That drops the wait the
+// sentence above describes: a client that names a resource absent from the
+// snapshot is answered without it and keeps waiting for that name, and a
+// resource the client has not named is never sent to it. Delivery of a newly
+// added EDS cluster or RDS route then relies on the client re-requesting with
+// the new name once its CDS or LDS changes, which Envoy does.
 //
 // SnapshotCache can operate as a REST or regular xDS backend. The snapshot
 // can be partial, e.g. only include RDS or EDS resources.
@@ -107,6 +112,8 @@ type snapshotCache struct {
 	// ads flag to hold responses until all resources are named
 	ads bool
 
+	subscriptionFilteredResponses bool
+
 	// snapshots are cached resources indexed by node IDs
 	snapshots map[string]ResourceSnapshot
 
@@ -117,17 +124,6 @@ type snapshotCache struct {
 	hash NodeHash
 
 	mu sync.RWMutex
-}
-
-// missingRequestResource is returned when the request is specifically dropped due to the resources in the request not matching the snapshot content.
-// This error is not returned to the user.
-// TODO(valerian-roche): remove this check which is very likely no longer needed.
-type missingRequestResource struct {
-	resources []string
-}
-
-func (e missingRequestResource) Error() string {
-	return fmt.Sprintf("missing resources in request: %v", e.resources)
 }
 
 // NewSnapshotCache initializes a simple cache.
@@ -143,6 +139,31 @@ func (e missingRequestResource) Error() string {
 // Logger is optional.
 func NewSnapshotCache(ads bool, hash NodeHash, logger log.Logger) SnapshotCache {
 	return newSnapshotCache(ads, hash, logger)
+}
+
+// Option configures a snapshot cache created with NewSnapshotCacheWithOptions.
+type Option func(*snapshotCache)
+
+// WithADS enables ADS response ordering and the legacy named-response policy.
+func WithADS() Option {
+	return func(cache *snapshotCache) { cache.ads = true }
+}
+
+// WithSubscriptionFilteredResponses allows named ADS responses to contain only
+// subscribed resources instead of waiting for every snapshot resource to be named.
+// It has no effect on wildcard responses, non-ADS caches, fetches, or delta watches.
+func WithSubscriptionFilteredResponses() Option {
+	return func(cache *snapshotCache) { cache.subscriptionFilteredResponses = true }
+}
+
+// NewSnapshotCacheWithOptions initializes a snapshot cache with optional policies.
+// By default ADS is disabled. Logger is optional.
+func NewSnapshotCacheWithOptions(hash NodeHash, logger log.Logger, opts ...Option) SnapshotCache {
+	cache := newSnapshotCache(false, hash, logger)
+	for _, opt := range opts {
+		opt(cache)
+	}
+	return cache
 }
 
 func newSnapshotCache(ads bool, hash NodeHash, logger log.Logger) *snapshotCache {
@@ -299,12 +320,9 @@ func (cache *snapshotCache) respondSOTWWatches(ctx context.Context, info *status
 		}
 
 		cache.log.Debugf("consider open watch %d %s %v with new version %q", id, watch.Request.GetTypeUrl(), watch.Request.GetResourceNames(), version)
-		resp, err := createResponse(snapshot, watch, cache.ads)
-		if errors.As(err, &missingRequestResource{}) {
-			return nil
-		}
-		if err != nil {
-			return err
+		resp, declined := createResponse(snapshot, watch, cache.ads, cache.subscriptionFilteredResponses)
+		if declined {
+			cache.log.Debugf("ADS mode: holding open watch %d %s %v at version %q: the snapshot has resources the client has not named", id, watch.Request.GetTypeUrl(), watch.Request.GetResourceNames(), version)
 		}
 		if resp != nil {
 			cache.log.Debugf("respond open watch %d %s %v with new version %q", id, watch.Request.GetTypeUrl(), watch.Request.GetResourceNames(), version)
@@ -453,6 +471,10 @@ func (cache *snapshotCache) CreateWatch(request *Request, sub Subscription, valu
 		return cache.cancelWatch(nodeID, watchID)
 	}
 
+	if !sub.IsWildcard() && len(sub.SubscribedResources()) == 0 {
+		return func() {}, nil
+	}
+
 	watch := ResponseWatch{Request: request, Response: value, subscription: sub, fullStateResponses: ResourceRequiresFullStateInSotw(request.GetTypeUrl())}
 
 	snapshot, exists := cache.snapshots[nodeID]
@@ -460,16 +482,9 @@ func (cache *snapshotCache) CreateWatch(request *Request, sub Subscription, valu
 		return createWatch(watch), nil
 	}
 
-	resp, err := createResponse(snapshot, watch, cache.ads)
-	if errors.As(err, &missingRequestResource{}) {
-		if len(sub.SubscribedResources()) == 0 {
-			return func() {}, nil
-		}
-		cache.log.Debugf("ADS mode: retaining watch for request %s %v: %v", request.GetTypeUrl(), request.GetResourceNames(), err)
-		return createWatch(watch), nil
-	}
-	if err != nil {
-		return func() {}, fmt.Errorf("failed to create response: %w", err)
+	resp, declined := createResponse(snapshot, watch, cache.ads, cache.subscriptionFilteredResponses)
+	if declined {
+		cache.log.Debugf("ADS mode: retaining watch for request %s %v: the snapshot has resources the client has not named", request.GetTypeUrl(), request.GetResourceNames())
 	}
 	if resp != nil {
 		if err := cache.respond(context.Background(), watch, resp); err != nil {
@@ -536,15 +551,30 @@ func difference[T any](resources map[string]types.ResourceWithTTL, names map[str
 // It may return a nil response to indicate the watch is up-to-date for the given snapshot.
 // It is currently inefficient as not evaluating known resources intrisic versions, but only the snapshot one.
 // Further work may be performed to optimize this.
-func createResponse(snapshot ResourceSnapshot, watch ResponseWatch, ads bool) (*RawResponse, error) {
+// createResponse returns a nil response with declined set when the legacy ADS
+// policy holds the response because the snapshot contains resources the client
+// has not named; callers log that so a withheld named type stays visible.
+func createResponse(snapshot ResourceSnapshot, watch ResponseWatch, ads, subscriptionFilteredResponses bool) (resp *RawResponse, declined bool) {
 	typeURL := watch.Request.TypeUrl
 	resources := snapshot.GetResourcesAndTTL(typeURL)
 
-	// for ADS, the request names must match the snapshot names
-	// if they do not, then the watch is never responded, and it is expected that envoy makes another request
+	subscribedResources := watch.subscription.SubscribedResources()
 	if !watch.subscription.IsWildcard() && ads {
-		if missing := difference(resources, watch.subscription.SubscribedResources()); len(missing) > 0 {
-			return nil, missingRequestResource{missing}
+		if subscriptionFilteredResponses {
+			filtered := make(map[string]types.ResourceWithTTL, len(subscribedResources))
+			for name := range subscribedResources {
+				if resource, ok := resources[name]; ok {
+					filtered[name] = resource
+				}
+			}
+			resources = filtered
+		} else {
+			// Preserve the legacy ADS policy until filtering is explicitly enabled.
+			for name := range resources {
+				if _, ok := subscribedResources[name]; !ok {
+					return nil, true
+				}
+			}
 		}
 	}
 
@@ -554,7 +584,6 @@ func createResponse(snapshot ResourceSnapshot, watch ResponseWatch, ads bool) (*
 	reqVersion := watch.Request.VersionInfo
 	version := snapshot.GetVersion(typeURL)
 
-	subscribedResources := watch.subscription.SubscribedResources()
 	knownResources := watch.subscription.ReturnedResources()
 
 	// Only populated if version has not changed.
@@ -591,7 +620,7 @@ func createResponse(snapshot ResourceSnapshot, watch ResponseWatch, ads bool) (*
 		if len(changedResources) == 0 && !watch.sendFullStateResponses() {
 			// If full state responses are needed we need to trigger if only deletions occurred,
 			// otherwise we can just bail out.
-			return nil, nil
+			return nil, false
 		}
 
 		for name := range knownResources {
@@ -614,7 +643,7 @@ func createResponse(snapshot ResourceSnapshot, watch ResponseWatch, ads bool) (*
 
 		if len(changedResources) == 0 && len(deletedResources) == 0 {
 			// Nothing's changed
-			return nil, nil
+			return nil, false
 		}
 	}
 
@@ -665,7 +694,7 @@ func createResponse(snapshot ResourceSnapshot, watch ResponseWatch, ads bool) (*
 		Version:           version,
 		resources:         resourcesToReturn,
 		returnedResources: returnedResources,
-	}, nil
+	}, false
 }
 
 func (cache *snapshotCache) respond(ctx context.Context, watch ResponseWatch, response *RawResponse) error {
