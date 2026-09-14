@@ -10,6 +10,8 @@
 
 ### Fixed
 
+- Send snapshot and heartbeat responses outside cache-wide locks, allowing unrelated nodes to progress while a response channel is full.
+
 - Preserve open SotW and delta watches when clearing snapshots, and remove cleared status after the last watch is canceled. `GetStatusInfo` now stays non-nil for a cleared node while its watches are open.
 
 - Retain new named ADS watches when the current snapshot contains unrequested resources, so a later aligned snapshot can answer them.

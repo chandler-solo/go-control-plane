@@ -76,6 +76,9 @@ type statusInfo struct {
 	// snapshotCleared removes retained status once its last watch is canceled.
 	snapshotCleared bool
 
+	// Pending deliveries keep cleared status alive until sending or restoration finishes.
+	responsesInFlight int
+
 	// the timestamp of the last watch request
 	lastWatchRequestTime time.Time
 
@@ -99,6 +102,9 @@ type ResponseWatch struct {
 
 	// Response is the channel to push responses to.
 	Response chan Response
+
+	// done interrupts a pending snapshot-cache send when this watch is canceled.
+	done <-chan struct{}
 
 	// Subscription stores the current client subscription state.
 	subscription Subscription
@@ -144,6 +150,9 @@ type DeltaResponseWatch struct {
 
 	// Response is the channel to push the delta responses to
 	Response chan DeltaResponse
+
+	// done interrupts a pending snapshot-cache send when this watch is canceled.
+	done <-chan struct{}
 
 	// Subscription stores the current client subscription state.
 	subscription Subscription

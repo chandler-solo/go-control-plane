@@ -80,7 +80,7 @@ func (s observedSnapshot) GetResourcesAndTTL(typ string) map[string]types.Resour
 	return s.ResourceSnapshot.GetResourcesAndTTL(typ)
 }
 
-func TestFullImmediateChannelBlocksOtherNode(t *testing.T) {
+func TestFullImmediateChannelDoesNotBlockOtherNode(t *testing.T) {
 	c := cache.NewSnapshotCache(true, kgwHash{}, nil)
 	entered := make(chan struct{}, 1)
 	snap := observedSnapshot{kgwEDS(t, "v1", cla("a", 1)), entered}
@@ -102,11 +102,14 @@ func TestFullImmediateChannelBlocksOtherNode(t *testing.T) {
 	other := make(chan error, 1)
 	otherSnap := kgwEDS(t, "v9", cla("z", 1))
 	go func() { other <- c.SetSnapshot(context.Background(), "another-node", otherSnap) }()
-	// Bounded absence observation after the immediate path entered under lock.
+	// The unrelated node completes while the first response channel stays full.
 	select {
 	case err := <-other:
-		t.Errorf("unrelated node escaped held cache lock: %v", err)
-	case <-time.After(100 * time.Millisecond):
+		if err != nil {
+			t.Error(err)
+		}
+	case <-time.After(time.Second):
+		t.Error("unrelated node blocked behind the full response channel")
 	}
 	<-full
 	select {
@@ -118,12 +121,220 @@ func TestFullImmediateChannelBlocksOtherNode(t *testing.T) {
 		t.Fatal("CreateWatch did not recover after drain")
 	}
 	expectResponse(t, full, "immediate response after drain")
+}
+
+func (s observedSnapshot) GetResources(typ string) map[string]types.Resource {
+	select {
+	case s.entered <- struct{}{}:
+	default:
+	}
+	return s.ResourceSnapshot.GetResources(typ)
+}
+
+func TestFullImmediateDeltaChannelDoesNotBlockOtherNode(t *testing.T) {
+	c := cache.NewSnapshotCache(true, kgwHash{}, nil)
+	entered := make(chan struct{}, 1)
+	if err := c.SetSnapshot(context.Background(), kgwNode, observedSnapshot{kgwEDS(t, "v1", cla("a", 1)), entered}); err != nil {
+		t.Fatal(err)
+	}
+	full := make(chan cache.DeltaResponse, 1)
+	full <- nil
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.CreateDeltaWatch(&discovery.DeltaDiscoveryRequest{TypeUrl: rsrc.EndpointType, ResourceNamesSubscribe: []string{"a"}}, stream.NewDeltaSubscription([]string{"a"}, nil, nil, false), full)
+		done <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("delta watch never read the snapshot")
+	}
+	other := make(chan error, 1)
+	otherSnap := kgwEDS(t, "v2", cla("z", 1))
+	go func() { other <- c.SetSnapshot(context.Background(), "other", otherSnap) }()
 	select {
 	case err := <-other:
 		if err != nil {
 			t.Error(err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("other node did not recover after drain")
+		t.Error("unrelated node blocked behind delta response")
 	}
+	<-full
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Error(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("delta watch did not finish after draining")
+	}
+	select {
+	case <-full:
+	case <-time.After(time.Second):
+		t.Fatal("missing immediate delta response")
+	}
+}
+
+func TestCancelBlockedSnapshotSend(t *testing.T) {
+	for _, delta := range []bool{false, true} {
+		name := "sotw"
+		if delta {
+			name = "delta"
+		}
+		t.Run(name, func(t *testing.T) {
+			c := cache.NewSnapshotCache(true, kgwHash{}, nil)
+			var watchCancel func()
+			var err error
+			if delta {
+				ch := make(chan cache.DeltaResponse, 1)
+				ch <- nil
+				watchCancel, err = c.CreateDeltaWatch(&discovery.DeltaDiscoveryRequest{TypeUrl: rsrc.EndpointType, ResourceNamesSubscribe: []string{"a"}}, stream.NewDeltaSubscription([]string{"a"}, nil, nil, false), ch)
+			} else {
+				ch := make(chan cache.Response, 1)
+				ch <- nil
+				watchCancel, err = c.CreateWatch(&discovery.DiscoveryRequest{TypeUrl: rsrc.EndpointType, ResourceNames: []string{"a"}}, stream.NewSotwSubscription([]string{"a"}, false), ch)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(watchCancel)
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			entered := make(chan struct{}, 1)
+			snapshot := observedSnapshot{kgwEDS(t, "v1", cla("a", 1)), entered}
+			done := make(chan error, 1)
+			go func() { done <- c.SetSnapshot(ctx, kgwNode, snapshot) }()
+			select {
+			case <-entered:
+			case <-time.After(time.Second):
+				t.Fatal("snapshot did not evaluate watch")
+			}
+			other := make(chan error, 1)
+			otherSnap := kgwEDS(t, "v2", cla("z", 1))
+			go func() { other <- c.SetSnapshot(ctx, "other", otherSnap) }()
+			select {
+			case err := <-other:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("blocked response held cache lock")
+			}
+			c.ClearSnapshot(kgwNode)
+			if c.GetStatusInfo(kgwNode) == nil {
+				t.Fatal("clear discarded in-flight watch status")
+			}
+			watchCancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("watch cancellation did not interrupt send")
+			}
+			if c.GetStatusInfo(kgwNode) != nil {
+				t.Fatal("canceled in-flight watch retained cleared status")
+			}
+		})
+	}
+}
+
+func TestWaitingSnapshotCanCancelAndRetry(t *testing.T) {
+	c := cache.NewSnapshotCache(true, kgwHash{}, nil)
+	responses := make(chan cache.Response)
+	watchCancel, err := c.CreateWatch(&discovery.DiscoveryRequest{TypeUrl: rsrc.EndpointType, ResourceNames: []string{"a"}}, stream.NewSotwSubscription([]string{"a"}, false), responses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(watchCancel)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	entered := make(chan struct{}, 1)
+	first := observedSnapshot{kgwEDS(t, "v1", cla("a", 1)), entered}
+	done := make(chan error, 1)
+	go func() { done <- c.SetSnapshot(ctx, kgwNode, first) }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("first publication did not evaluate watch")
+	}
+	waiting, stop := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer stop()
+	if err := c.SetSnapshot(waiting, kgwNode, kgwEDS(t, "v2", cla("a", 2))); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waiting publication did not cancel: %v", err)
+	}
+	if got, err := c.GetSnapshot(kgwNode); err != nil || got != first {
+		t.Fatal("waiting publication overtook the pending response")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected canceled send, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first publication did not cancel")
+	}
+	if c.GetStatusInfo(kgwNode).GetNumWatches() != 1 {
+		t.Fatal("failed send did not restore the watch")
+	}
+	third := kgwEDS(t, "v3", cla("a", 3))
+	go func() { done <- c.SetSnapshot(context.Background(), kgwNode, third) }()
+	got := expectResponse(t, responses, "retry answers restored watch")
+	if got.GetResponseVersion() != "v3" {
+		t.Fatalf("retry sent version %q", got.GetResponseVersion())
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retry did not finish")
+	}
+}
+
+func TestBlockedHeartbeatDoesNotBlockOtherNode(t *testing.T) {
+	ctx := t.Context()
+	c := cache.NewSnapshotCacheWithHeartbeating(ctx, true, kgwHash{}, nil, 10*time.Millisecond)
+	ttl := time.Second
+	snap, err := cache.NewSnapshotWithTTLs("v1", map[rsrc.Type][]types.ResourceWithTTL{rsrc.EndpointType: {{Resource: cla("a", 1), TTL: &ttl}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{}, 8)
+	if err := c.SetSnapshot(ctx, kgwNode, observedSnapshot{snap, entered}); err != nil {
+		t.Fatal(err)
+	}
+	full := make(chan cache.Response, 1)
+	full <- nil
+	sub := stream.NewSotwSubscription([]string{"a"}, false)
+	sub.SetReturnedResources(map[string]string{"a": "v1"})
+	watchCancel, err := c.CreateWatch(&discovery.DiscoveryRequest{TypeUrl: rsrc.EndpointType, ResourceNames: []string{"a"}, VersionInfo: "v1"}, sub, full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer watchCancel()
+	// First read is CreateWatch; the next read is the heartbeat preparation.
+	for range 2 {
+		select {
+		case <-entered:
+		case <-time.After(time.Second):
+			t.Fatal("heartbeat did not evaluate parked watch")
+		}
+	}
+	other := make(chan error, 1)
+	otherSnap := kgwEDS(t, "v2", cla("z", 1))
+	go func() { other <- c.SetSnapshot(ctx, "other", otherSnap) }()
+	select {
+	case err := <-other:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat held the cache lock during send")
+	}
+	watchCancel()
 }
