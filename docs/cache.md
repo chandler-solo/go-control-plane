@@ -69,3 +69,21 @@ if err := cache.SetSnapshot("envoy-node-id", snapshot); err != nil {
 This will trigger all open watches internal to the caching [config watchers](https://github.com/envoyproxy/go-control-plane/blob/main/pkg/cache/v3/cache.go#L45) and anything listening for changes will received updates and responses from the new snapshot.
 
 *Note*: that a node ID must be provided along with the snapshot object. Internally a mapping of the two is kept so each node can receive the latest version of its configuration.
+
+## Clearing snapshots
+
+`ClearSnapshot(node)` removes the cached snapshot. Open SotW and delta watches
+remain registered so the next `SetSnapshot` for that node can answer them.
+Clearing does not send a response or close response channels. Status remains
+available while watches are open and is removed when the last watch is canceled.
+Publishing another snapshot keeps the node's status available as usual.
+
+To discard both the snapshot and node status immediately, cancel the node's
+streams and their watches before calling `ClearSnapshot`.
+
+This changes what callers observe: `GetStatusInfo(node)` returns a non-nil
+status for a cleared node while any of its watches are open. Code that used a
+nil status after `ClearSnapshot` as the signal that a node is gone should check
+`GetSnapshot` for the absent snapshot instead, or cancel the streams first.
+Cancelling a watch takes only the read lock unless it is the last watch of a
+cleared node, so the retained status does not slow down watch churn.

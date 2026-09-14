@@ -82,7 +82,9 @@ type SnapshotCache interface {
 	// GetSnapshots gets the snapshot for a node.
 	GetSnapshot(node string) (ResourceSnapshot, error)
 
-	// ClearSnapshot removes all status and snapshot information associated with a node.
+	// ClearSnapshot removes the snapshot associated with a node. Status is retained
+	// while watches are open so a later snapshot can answer them. To remove all
+	// status immediately, cancel the node's streams before clearing its snapshot.
 	ClearSnapshot(node string)
 
 	// GetStatusInfo retrieves status information for a node ID.
@@ -273,6 +275,7 @@ func (cache *snapshotCache) SetSnapshot(ctx context.Context, node string, snapsh
 	if info, ok := cache.status[node]; ok {
 		info.mu.Lock()
 		defer info.mu.Unlock()
+		info.snapshotCleared = false
 
 		// Respond to SOTW watches for the node.
 		if err := cache.respondSOTWWatches(ctx, info, snapshot); err != nil {
@@ -403,13 +406,25 @@ func (cache *snapshotCache) GetSnapshot(node string) (ResourceSnapshot, error) {
 	return snap, nil
 }
 
-// ClearSnapshot clears snapshot and info for a node.
+// ClearSnapshot clears a node's snapshot, retaining status for open watches.
 func (cache *snapshotCache) ClearSnapshot(node string) {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 
 	delete(cache.snapshots, node)
-	delete(cache.status, node)
+	if info, ok := cache.status[node]; ok {
+		info.mu.Lock()
+		defer info.mu.Unlock()
+		info.snapshotCleared = true
+		cache.removeClearedStatus(node, info)
+	}
+}
+
+// removeClearedStatus requires both cache.mu and info.mu to be held for writing.
+func (cache *snapshotCache) removeClearedStatus(node string, info *statusInfo) {
+	if info.snapshotCleared && len(info.watches) == 0 && len(info.deltaWatches) == 0 {
+		delete(cache.status, node)
+	}
 }
 
 // CreateWatch returns a watch for an xDS request.  A nil function may be
@@ -475,14 +490,34 @@ func (cache *snapshotCache) nextWatchID() int64 {
 // cancellation function for cleaning stale watches.
 func (cache *snapshotCache) cancelWatch(nodeID string, watchID int64) func() {
 	return func() {
-		// uses the cache mutex
+		// The common case only needs the read lock: cancels must not serialize
+		// against every SetSnapshot for the sake of the rare cleared node.
 		cache.mu.RLock()
-		defer cache.mu.RUnlock()
+		var idleCleared bool
 		if info, ok := cache.status[nodeID]; ok {
 			info.mu.Lock()
 			delete(info.watches, watchID)
+			idleCleared = info.snapshotCleared && len(info.watches) == 0 && len(info.deltaWatches) == 0
 			info.mu.Unlock()
 		}
+		cache.mu.RUnlock()
+		if idleCleared {
+			cache.dropClearedStatus(nodeID)
+		}
+	}
+}
+
+// dropClearedStatus removes a node's status if it is still cleared and has no
+// watches. It re-checks under the write lock because a SetSnapshot or a new
+// watch can arrive between a cancel's read-locked check and this call; either
+// makes the status live again and it must stay.
+func (cache *snapshotCache) dropClearedStatus(nodeID string) {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	if info, ok := cache.status[nodeID]; ok {
+		info.mu.Lock()
+		cache.removeClearedStatus(nodeID, info)
+		info.mu.Unlock()
 	}
 }
 
@@ -796,11 +831,16 @@ func (cache *snapshotCache) nextDeltaWatchID() int64 {
 func (cache *snapshotCache) cancelDeltaWatch(nodeID string, watchID int64) func() {
 	return func() {
 		cache.mu.RLock()
-		defer cache.mu.RUnlock()
+		var idleCleared bool
 		if info, ok := cache.status[nodeID]; ok {
 			info.mu.Lock()
 			delete(info.deltaWatches, watchID)
+			idleCleared = info.snapshotCleared && len(info.watches) == 0 && len(info.deltaWatches) == 0
 			info.mu.Unlock()
+		}
+		cache.mu.RUnlock()
+		if idleCleared {
+			cache.dropClearedStatus(nodeID)
 		}
 	}
 }
