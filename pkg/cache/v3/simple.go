@@ -339,7 +339,7 @@ func (cache *snapshotCache) SetSnapshot(ctx context.Context, node string, snapsh
 func (cache *snapshotCache) collectSotwResponses(info *statusInfo, snapshot ResourceSnapshot) []pendingSotwResponse {
 	var pending []pendingSotwResponse
 	collect := func(id int64, watch ResponseWatch) {
-		if snapshot.GetVersion(watch.Request.GetTypeUrl()) == watch.Request.GetVersionInfo() {
+		if !watch.answerFirstSnapshot && snapshot.GetVersion(watch.Request.GetTypeUrl()) == watch.Request.GetVersionInfo() {
 			return
 		}
 		resp, declined := createResponse(snapshot, watch, cache.ads, cache.subscriptionFilteredResponses)
@@ -470,6 +470,10 @@ func (cache *snapshotCache) prepareWatch(request *Request, sub Subscription, val
 
 	snapshot, exists := cache.snapshots[nodeID]
 	if !exists {
+		// No snapshot to compare against. Whatever version the request names
+		// was accepted on a previous stream or from a previous control plane;
+		// the first snapshot for this node must answer regardless of it.
+		watch.answerFirstSnapshot = true
 		return createWatch(watch), watch, nil
 	}
 
@@ -570,6 +574,11 @@ func createResponse(snapshot ResourceSnapshot, watch ResponseWatch, ads, subscri
 	// This allows for a more generic implemenentation when considering wildcard + subscribed, or partial replies.
 
 	reqVersion := watch.Request.VersionInfo
+	if watch.answerFirstSnapshot {
+		// See ResponseWatch.answerFirstSnapshot: the held version is not one
+		// this cache sent, so it does not make the watch up to date.
+		reqVersion = ""
+	}
 	version := snapshot.GetVersion(typeURL)
 
 	knownResources := watch.subscription.ReturnedResources()

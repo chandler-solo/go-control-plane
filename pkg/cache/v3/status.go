@@ -111,6 +111,12 @@ type ResponseWatch struct {
 
 	// fullStateResponses requires that all resources matching the request, with no regards to which ones actually updated, must be provided in the response.
 	fullStateResponses bool
+
+	// answerFirstSnapshot marks a watch created while the node had no snapshot.
+	// The version such a request carries came from a previous stream or a
+	// previous control plane, and nothing has been sent on this watch, so the
+	// first snapshot answers it even when its version equals the request's.
+	answerFirstSnapshot bool
 }
 
 func (w ResponseWatch) isDelta() bool {
