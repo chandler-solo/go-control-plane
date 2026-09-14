@@ -125,7 +125,7 @@ func TestParkedNamedWatchIsRetainedOnDeclinedResponse(t *testing.T) {
 	}
 }
 
-func TestDeclinedNewRequestRegistersNoWatch(t *testing.T) {
+func TestDeclinedNewRequestRetainsWatch(t *testing.T) {
 	ctx := context.Background()
 	c := cache.NewSnapshotCache(true, kgwHash{}, nil)
 	if err := c.SetSnapshot(ctx, kgwNode, kgwEDS(t, "v2", cla("a", 1), cla("b", 1))); err != nil {
@@ -135,17 +135,28 @@ func TestDeclinedNewRequestRegistersNoWatch(t *testing.T) {
 	req := &discovery.DiscoveryRequest{TypeUrl: rsrc.EndpointType, ResourceNames: []string{"a"}, VersionInfo: "v1"}
 	sub := stream.NewSotwSubscription([]string{"a"}, false)
 	ch := make(chan cache.Response, 1)
-	if _, err := c.CreateWatch(req, sub, ch); err != nil {
+	cancel, err := c.CreateWatch(req, sub, ch)
+	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(cancel)
 	expectSilence(t, ch, "version differs but superset declines")
-	if n := c.GetStatusInfo(kgwNode).GetNumWatches(); n != 0 {
-		t.Fatalf("declined request left a watch registered (%d): watch retention changed; update this expectation", n)
+	if n := c.GetStatusInfo(kgwNode).GetNumWatches(); n != 1 {
+		t.Fatalf("declined request registered %d watches, want 1", n)
 	}
 	if err := c.SetSnapshot(ctx, kgwNode, kgwEDS(t, "v3", cla("a", 2))); err != nil {
 		t.Fatal(err)
 	}
-	expectSilence(t, ch, "aligned v3 snapshot against an unregistered request (correct behavior is delivery)")
+	got := expectResponse(t, ch, "aligned snapshot answers the retained request")
+	if got.GetResponseVersion() != "v3" || len(got.GetReturnedResources()) != 1 {
+		t.Fatalf("unexpected retained-watch response: version %q resources %v", got.GetResponseVersion(), got.GetReturnedResources())
+	}
+	if _, ok := got.GetReturnedResources()["a"]; !ok {
+		t.Fatalf("response omitted requested resource a: %v", got.GetReturnedResources())
+	}
+	if n := c.GetStatusInfo(kgwNode).GetNumWatches(); n != 0 {
+		t.Fatalf("answered watch remains registered: %d watches", n)
+	}
 }
 
 func TestEqualVersionRespondsForNewlySubscribedResource(t *testing.T) {

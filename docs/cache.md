@@ -17,6 +17,12 @@ This `cache` object holds a fully compliant [SnapshotCache](https://github.com/e
 
 ## Snapshots
 
+In ADS mode, a named request is retained as an open watch when the snapshot
+contains resources outside the subscription and cannot yet be sent. A later
+snapshot aligned with the subscription answers that watch without another
+client request. These retained requests are included in `GetNumWatches` and
+can be removed using the cancellation function returned by `CreateWatch`.
+
 Snapshots are groupings of resources at a given point in time for a node cluster. In other words Envoy's and consuming xDS clients registering as node `abc` all share a snapshot of config. This snapshot is the singular source of truth in the cache that represents config for any of those consumers.
 
 > *NOTE*: Snapshots can be partial, e.g., only including RDS or EDS resources. 

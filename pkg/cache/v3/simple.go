@@ -446,11 +446,12 @@ func (cache *snapshotCache) CreateWatch(request *Request, sub Subscription, valu
 	}
 
 	resp, err := createResponse(snapshot, watch, cache.ads)
-	// Specific legacy case. We explicitly drop the request (and therefore do not reply or track the watch) while keeping the stream opened.
-	// TODO(valerian-roche): this is likely unneeded now, to be cleaned
 	if errors.As(err, &missingRequestResource{}) {
-		cache.log.Warnf("ADS mode: not responding to request %s %v: %v", request.GetTypeUrl(), request.GetResourceNames(), err)
-		return func() {}, nil
+		if len(sub.SubscribedResources()) == 0 {
+			return func() {}, nil
+		}
+		cache.log.Debugf("ADS mode: retaining watch for request %s %v: %v", request.GetTypeUrl(), request.GetResourceNames(), err)
+		return createWatch(watch), nil
 	}
 	if err != nil {
 		return func() {}, fmt.Errorf("failed to create response: %w", err)
