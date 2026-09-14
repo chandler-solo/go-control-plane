@@ -131,16 +131,25 @@ func (s *server) process(str stream.Stream, reqCh chan *discovery.DiscoveryReque
 			}
 
 			responder := make(chan cache.Response, 1)
-			cancel, err := s.cache.CreateWatch(req, subscription, responder)
+			cacheReq := req
+			if s.opts.NackDamping {
+				cacheReq = w.dampNack(req)
+			}
+			cancel, err := s.cache.CreateWatch(cacheReq, subscription, responder)
 			if err != nil {
 				s.opts.Logger.Warnf("[sotw] Watch rejected for type %s and stream %d", typeURL, sw.ID)
 				return err
 			}
-			sw.watches.addWatch(typeURL, &watch{
+			next := &watch{
 				cancel:   cancel,
 				response: responder,
 				sub:      subscription,
-			})
+			}
+			if s.opts.NackDamping && w != nil {
+				next.nonce = w.nonce
+				next.lastVersion = w.lastVersion
+			}
+			sw.watches.addWatch(typeURL, next)
 
 			// Recompute the dynamic select cases for this stream.
 			sw.watches.recompute(s.ctx, reqCh)
